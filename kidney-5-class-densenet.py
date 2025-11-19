@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python
 # coding: utf-8
 
@@ -6,13 +7,20 @@ from tensorflow.keras.layers import *
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 import tensorflow.keras.backend as K
+import numpy as np
+
 from keras_segmentation.data_utils.data_loader import image_segmentation_generator
 
+# Albumentations
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
 
 # ============================================================
-#  Weighted Cross Entropy (same as UNet)
+#  Weighted Categorical Cross-Entropy
 # ============================================================
 def weighted_cce(class_weights):
+
     class_weights = tf.constant(class_weights, dtype=tf.float32)
 
     def loss(y_true, y_pred):
@@ -38,11 +46,64 @@ def iou_coef(y_true, y_pred, smooth=1.0):
 
 
 # ============================================================
-#  SegRenal DenseNet169 UNet
+#  Albumentations Augmentation (as in SegRenal paper)
+# ============================================================
+train_aug = A.Compose([
+    A.HorizontalFlip(p=0.5),
+    A.VerticalFlip(p=0.5),
+    A.Rotate(limit=15, p=0.5),
+    A.ShiftScaleRotate(
+        shift_limit=0.10,
+        scale_limit=0.10,
+        rotate_limit=0,
+        border_mode=0,
+        p=0.5
+    ),
+    A.RandomBrightnessContrast(
+        brightness_limit=0.2,
+        contrast_limit=0.2,
+        p=0.3
+    ),
+    A.RandomResizedCrop(
+        height=512,
+        width=512,
+        scale=(0.9, 1.1),
+        ratio=(0.9, 1.1),
+        p=0.5
+    ),
+])
+
+val_aug = A.Compose([])   # VALIDATION → No augmentation
+
+
+# ============================================================
+#  CUSTOM GENERATOR (Albumentations-compatible)
+# ============================================================
+def albumentations_generator(img_path, mask_path, batch_size, n_classes, aug):
+
+    base_gen = image_segmentation_generator(
+        img_path, mask_path,
+        batch_size, n_classes,
+        512, 512, 512, 512
+    )
+
+    while True:
+        imgs, masks = next(base_gen)
+
+        imgs_aug, masks_aug = [], []
+
+        for i in range(imgs.shape[0]):
+            augmented = aug(image=imgs[i], mask=masks[i])
+            imgs_aug.append(augmented["image"])
+            masks_aug.append(augmented["mask"])
+
+        yield np.array(imgs_aug), np.array(masks_aug)
+
+
+# ============================================================
+#  SegRenal DenseNet169 Architecture
 # ============================================================
 def SegRenal_DenseNet169(input_height, input_width, n_classes, pretrained=True):
-    assert input_height % 32 == 0
-    assert input_width % 32 == 0
 
     inputs = Input(shape=(input_height, input_width, 3))
 
@@ -52,22 +113,15 @@ def SegRenal_DenseNet169(input_height, input_width, n_classes, pretrained=True):
         input_tensor=inputs
     )
 
-    # -------------------------
-    # Freeze layers if pretrained
-    # -------------------------
     if pretrained:
         for layer in base.layers:
             layer.trainable = False
 
-    # Encoder feature maps
     f1 = base.get_layer('conv1/relu').output
     f2 = base.get_layer('pool2_conv').output
     f3 = base.get_layer('pool3_conv').output
     f4 = base.get_layer('pool4_conv').output
 
-    # -------------------------
-    # Decoder
-    # -------------------------
     x = ZeroPadding2D((1, 1))(f4)
     x = Conv2D(512, 3, activation="relu", padding="valid")(x)
     x = BatchNormalization()(x)
@@ -93,50 +147,37 @@ def SegRenal_DenseNet169(input_height, input_width, n_classes, pretrained=True):
     x = UpSampling2D((2, 2))(x)
     x = Conv2D(n_classes, 3, padding="same")(x)
 
-    # Reshape for softmax
     x = Reshape((input_height * input_width, n_classes))(x)
-    x = Activation('softmax')(x)
+    x = Activation("softmax")(x)
 
     return Model(inputs, x)
 
 
 # ============================================================
-#                 TRAINING PIPELINE
+#  TRAINING PIPELINE
 # ============================================================
-
-# ----------- Hyperparameters (from your Table 1) ----------
 input_size = 512
 n_classes = 6
 batch_size = 4
+learning_rate = 1e-4
+pretrained = True
 
-# You can switch depending on the model row in Table 1:
-learning_rate = 1e-4         # DenseNet pretrained
-# learning_rate = 5e-4       # DenseNet no-pretrain
-
-pretrained = True            # or False for second DenseNet
-
-class_weights = [1, 1, 1, 1, 1, 1]  # placeholder; update per your dataset
+class_weights = [1, 1, 1, 1, 1, 1]
 
 
-# -------------------- Data Generators ----------------------
-train_gen = image_segmentation_generator(
+train_gen = albumentations_generator(
     "/projects/dlmpfl/ibrahim/kidney/paper_dataset_training/Train/image",
     "/projects/dlmpfl/ibrahim/kidney/paper_dataset_training/Train/mask",
-    batch_size, n_classes,
-    input_size, input_size,
-    input_size, input_size
+    batch_size, n_classes, train_aug
 )
 
-val_gen = image_segmentation_generator(
+val_gen = albumentations_generator(
     "/projects/dlmpfl/ibrahim/kidney/paper_dataset_validation/Test/image",
     "/projects/dlmpfl/ibrahim/kidney/paper_dataset_validation/Test/mask",
-    batch_size, n_classes,
-    input_size, input_size,
-    input_size, input_size
+    batch_size, n_classes, val_aug
 )
 
 
-# ---------------- Build Model ---------------------
 model = SegRenal_DenseNet169(
     input_height=input_size,
     input_width=input_size,
@@ -153,11 +194,10 @@ model.compile(
 )
 
 
-# ---------------- Callbacks -----------------------
 checkpoint = ModelCheckpoint(
-    '/projects/dlmpfl/ibrahim/kidney/paper_dataset_model/densenet169_best.h5',
+    "/projects/dlmpfl/ibrahim/kidney/paper_dataset_model/densenet169_best.h5",
     monitor='val_iou_coef',
-    mode='max',
+    mode="max",
     save_best_only=True,
     verbose=1
 )
@@ -177,17 +217,14 @@ reduce_lr = ReduceLROnPlateau(
     verbose=1
 )
 
-callbacks = [checkpoint, early_stop, reduce_lr]
 
-
-# ---------------- Train ---------------------------
 model.fit(
     train_gen,
     steps_per_epoch=512,
     validation_data=val_gen,
     validation_steps=512,
-    epochs=500,         # per Table 1
-    callbacks=callbacks
+    epochs=500,
+    callbacks=[checkpoint, early_stop, reduce_lr]
 )
 
-model.save('/projects/dlmpfl/ibrahim/kidney/paper_dataset_model/densenet169_last.h5')
+model.save("/projects/dlmpfl/ibrahim/kidney/paper_dataset_model/densenet169_last.h5")
